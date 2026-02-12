@@ -11,6 +11,7 @@ mod task;
 #[macro_use]
 extern crate tg_console;
 
+use core::cell::UnsafeCell;
 use impls::{Console, SyscallContext};
 use riscv::register::*;
 use task::TaskControlBlock;
@@ -22,6 +23,13 @@ use tg_sbi;
 core::arch::global_asm!(include_str!(env!("APP_ASM")));
 // 应用程序数量。
 const APP_CAPACITY: usize = 32;
+
+struct TaskTable(UnsafeCell<[TaskControlBlock; APP_CAPACITY]>);
+
+// 单核启动阶段独占访问任务表
+unsafe impl Sync for TaskTable {}
+
+static TASK_TABLE: TaskTable = TaskTable(UnsafeCell::new([TaskControlBlock::ZERO; APP_CAPACITY]));
 // 定义内核入口。
 #[cfg(target_arch = "riscv64")]
 tg_linker::boot0!(rust_main; stack = (APP_CAPACITY + 2) * 8192);
@@ -40,13 +48,13 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_trace(&SyscallContext);
     // 任务控制块
-    let mut tcbs = [TaskControlBlock::ZERO; APP_CAPACITY];
+    let tcbs = unsafe { &mut *TASK_TABLE.0.get() };
     let mut index_mod = 0;
     // 初始化
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let entry = app.as_ptr() as usize;
         log::info!("load app{i} to {entry:#x}");
-        tcbs[i].init(entry);
+        tcbs[i].init(entry, i);
         index_mod += 1;
     }
     println!();
@@ -189,17 +197,23 @@ mod impls {
     }
 
     impl Trace for SyscallContext {
-        // TODO: 实现 trace 系统调用
         #[inline]
         fn trace(
             &self,
-            _caller: tg_syscall::Caller,
-            _trace_request: usize,
-            _id: usize,
-            _data: usize,
+            caller: tg_syscall::Caller,
+            trace_request: usize,
+            id: usize,
+            data: usize,
         ) -> isize {
-            tg_console::log::info!("trace: not implemented");
-            -1
+            match trace_request {
+                0 => unsafe { *(id as *const u8) as isize },
+                1 => {
+                    unsafe { *(id as *mut u8) = data as u8 };
+                    0
+                }
+                2 => caller.flow as isize,
+                _ => -1,
+            }
         }
     }
 }
