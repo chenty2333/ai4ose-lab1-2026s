@@ -24,11 +24,13 @@ core::arch::global_asm!(include_str!(env!("APP_ASM")));
 // 应用程序数量。
 const APP_CAPACITY: usize = 32;
 
+// 用一个包裹类型承载任务表，内部用 UnsafeCell 提供可变访问能力。
 struct TaskTable(UnsafeCell<[TaskControlBlock; APP_CAPACITY]>);
 
-// 单核启动阶段独占访问任务表
+// 这里手动实现 Sync：在本章单核执行模型里，任务表由内核串行访问，不存在并发写竞争。
 unsafe impl Sync for TaskTable {}
 
+// 把任务表放到静态区（.bss/.data），避免在 rust_main 栈上分配过大数组导致栈溢出。
 static TASK_TABLE: TaskTable = TaskTable(UnsafeCell::new([TaskControlBlock::ZERO; APP_CAPACITY]));
 // 定义内核入口。
 #[cfg(target_arch = "riscv64")]
@@ -48,12 +50,14 @@ extern "C" fn rust_main() -> ! {
     tg_syscall::init_clock(&SyscallContext);
     tg_syscall::init_trace(&SyscallContext);
     // 任务控制块
+    // 从静态任务表拿到可变引用；生命周期覆盖整个内核主循环。
     let tcbs = unsafe { &mut *TASK_TABLE.0.get() };
     let mut index_mod = 0;
     // 初始化
     for (i, app) in tg_linker::AppMeta::locate().iter().enumerate() {
         let entry = app.as_ptr() as usize;
         log::info!("load app{i} to {entry:#x}");
+        // 初始化每个任务时传入它自己的 task_id=i，供 trace 统计按任务隔离。
         tcbs[i].init(entry, i);
         index_mod += 1;
     }
@@ -200,18 +204,29 @@ mod impls {
         #[inline]
         fn trace(
             &self,
+            // caller 由 TaskControlBlock::handle_syscall 构造；这里主要使用 caller.flow。
             caller: tg_syscall::Caller,
+            // trace_request 决定本次 trace 调用要执行的操作类型（读/写/查计数）。
             trace_request: usize,
+            // 语义随 trace_request 变化：
+            // - request=0/1 时它是用户指针地址；
+            // - request=2 时它是目标 syscall id。
             id: usize,
+            // request=1 时作为待写入字节的来源（仅低 8 位有效）。
             data: usize,
         ) -> isize {
             match trace_request {
+                // request=0: 把 id 当作 *const u8，从用户地址读取 1 字节并返回。
                 0 => unsafe { *(id as *const u8) as isize },
                 1 => {
+                    // request=1: 把 id 当作 *mut u8，将 data 的低 8 位写回用户地址。
                     unsafe { *(id as *mut u8) = data as u8 };
+                    // 约定写成功返回 0。
                     0
                 }
+                // request=2: 直接返回 handle_syscall 预先计算好的“目标 syscall 调用次数”。
                 2 => caller.flow as isize,
+                // 其他 request 值都视为非法，按实验要求返回 -1。
                 _ => -1,
             }
         }
