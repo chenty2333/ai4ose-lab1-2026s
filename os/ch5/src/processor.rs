@@ -3,6 +3,9 @@ use alloc::collections::{BTreeMap, VecDeque};
 use core::cell::UnsafeCell;
 use tg_task_manage::{Manage, PManager, ProcId, Schedule};
 
+/// stride 调度的大步长常数
+const BIG_STRIDE: usize = 0x7fff_ffff;
+
 pub struct Processor {
     inner: UnsafeCell<PManager<Process, ProcManager>>,
 }
@@ -26,7 +29,7 @@ pub static PROCESSOR: Processor = Processor::new();
 
 /// 任务管理器
 /// `tasks` 中保存所有的任务实体
-/// `ready_queue` 删除任务的实体
+/// `ready_queue` 保存就绪进程的 id
 pub struct ProcManager {
     tasks: BTreeMap<ProcId, Process>,
     ready_queue: VecDeque<ProcId>,
@@ -65,8 +68,26 @@ impl Schedule<ProcId> for ProcManager {
     fn add(&mut self, id: ProcId) {
         self.ready_queue.push_back(id);
     }
-    /// 从调度队列中取出 id
+    /// stride 调度：从就绪队列中取出 stride 最小的进程
     fn fetch(&mut self) -> Option<ProcId> {
-        self.ready_queue.pop_front()
+        if self.ready_queue.is_empty() {
+            return None;
+        }
+        let mut min_idx = 0;
+        let mut min_stride = usize::MAX;
+        for (i, &id) in self.ready_queue.iter().enumerate() {
+            if let Some(proc) = self.tasks.get(&id) {
+                if proc.stride < min_stride {
+                    min_stride = proc.stride;
+                    min_idx = i;
+                }
+            }
+        }
+        let id = self.ready_queue.remove(min_idx).unwrap();
+        // 更新 stride
+        if let Some(proc) = self.tasks.get_mut(&id) {
+            proc.stride += BIG_STRIDE / proc.priority;
+        }
+        Some(id)
     }
 }

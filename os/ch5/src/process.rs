@@ -23,6 +23,10 @@ pub struct Process {
     pub heap_bottom: usize,
     /// 当前程序 break 位置
     pub program_brk: usize,
+    /// stride 调度：当前步进值
+    pub stride: usize,
+    /// stride 调度：优先级（>= 2）
+    pub priority: usize,
 }
 
 impl Process {
@@ -52,6 +56,8 @@ impl Process {
             address_space,
             heap_bottom: self.heap_bottom,
             program_brk: self.program_brk,
+            stride: 0,
+            priority: self.priority,
         })
     }
 
@@ -131,6 +137,8 @@ impl Process {
             address_space,
             heap_bottom,
             program_brk: heap_bottom,
+            stride: 0,
+            priority: 16,
         })
     }
 

@@ -452,14 +452,29 @@ mod impls {
             current.pid.get_usize() as _
         }
 
-        // TODO: 实现 spawn 系统调用
-        fn spawn(&self, _caller: Caller, _path: usize, _count: usize) -> isize {
-            let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "spawn: parent pid = {}, not implemented",
-                current.pid.get_usize()
-            );
-            -1
+        // 实现 spawn 系统调用
+        fn spawn(&self, _caller: Caller, path: usize, count: usize) -> isize {
+            const READABLE: VmFlags<Sv39> = build_flags("RV");
+            let processor: *mut PManager<ProcStruct, ProcManager> = PROCESSOR.get_mut() as *mut _;
+            let current = unsafe { (*processor).current().unwrap() };
+            let parent_pid = current.pid;
+            let result = current
+                .address_space
+                .translate::<u8>(VAddr::new(path), READABLE)
+                .map(|ptr| unsafe {
+                    core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr.as_ptr(), count))
+                })
+                .and_then(|name| APPS.get(name))
+                .and_then(|input| ElfFile::new(input).ok())
+                .and_then(|elf| ProcStruct::from_elf(elf));
+            match result {
+                Some(child) => {
+                    let pid = child.pid;
+                    unsafe { (*processor).add(pid, child, parent_pid) };
+                    pid.get_usize() as isize
+                }
+                None => -1,
+            }
         }
 
         fn sbrk(&self, _caller: Caller, size: i32) -> isize {
@@ -478,15 +493,14 @@ mod impls {
             0
         }
 
-        // TODO: 实现 set_priority 系统调用
+        // 实现 set_priority 系统调用
         fn set_priority(&self, _caller: Caller, prio: isize) -> isize {
+            if prio < 2 {
+                return -1;
+            }
             let current = PROCESSOR.get_mut().current().unwrap();
-            tg_console::log::info!(
-                "set_priority: pid = {}, prio = {}, not implemented",
-                current.pid.get_usize(),
-                prio
-            );
-            -1
+            current.priority = prio as usize;
+            prio
         }
     }
 
@@ -520,7 +534,6 @@ mod impls {
     }
 
     impl Memory for SyscallContext {
-        // TODO: 实现 mmap 系统调用
         fn mmap(
             &self,
             _caller: Caller,
@@ -531,16 +544,82 @@ mod impls {
             _fd: i32,
             _offset: usize,
         ) -> isize {
-            tg_console::log::info!(
-                "mmap: addr = {addr:#x}, len = {len}, prot = {prot}, not implemented"
-            );
-            -1
+            const PAGE_SIZE: usize = 1 << <Sv39 as MmuMeta>::PAGE_BITS;
+
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+            if prot & 0x7 == 0 {
+                return -1;
+            }
+            if prot & !0x7 != 0 {
+                return -1;
+            }
+
+            let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            if len_aligned == 0 {
+                return 0;
+            }
+
+            let start_vpn = VPN::<Sv39>::new(addr >> <Sv39 as MmuMeta>::PAGE_BITS);
+            let end_vpn = VPN::<Sv39>::new((addr + len_aligned) >> <Sv39 as MmuMeta>::PAGE_BITS);
+
+            let current = PROCESSOR.get_mut().current().unwrap();
+
+            for area in &current.address_space.areas {
+                if start_vpn < area.end && end_vpn > area.start {
+                    return -1;
+                }
+            }
+
+            let mut flags_str: [u8; 5] = *b"U___V";
+            if prot & 0x4 != 0 {
+                flags_str[1] = b'X';
+            }
+            if prot & 0x2 != 0 {
+                flags_str[2] = b'W';
+            }
+            if prot & 0x1 != 0 {
+                flags_str[3] = b'R';
+            }
+            let flags = crate::parse_flags(
+                unsafe { core::str::from_utf8_unchecked(&flags_str) }
+            ).unwrap();
+
+            current.address_space.map(start_vpn..end_vpn, &[], 0, flags);
+            0
         }
 
-        // TODO: 实现 munmap 系统调用
         fn munmap(&self, _caller: Caller, addr: usize, len: usize) -> isize {
-            tg_console::log::info!("munmap: addr = {addr:#x}, len = {len}, not implemented");
-            -1
+            const PAGE_SIZE: usize = 1 << <Sv39 as MmuMeta>::PAGE_BITS;
+
+            if addr % PAGE_SIZE != 0 {
+                return -1;
+            }
+
+            let len_aligned = (len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+            if len_aligned == 0 {
+                return 0;
+            }
+
+            let start_vpn = VPN::<Sv39>::new(addr >> <Sv39 as MmuMeta>::PAGE_BITS);
+            let end_vpn = VPN::<Sv39>::new((addr + len_aligned) >> <Sv39 as MmuMeta>::PAGE_BITS);
+
+            let current = PROCESSOR.get_mut().current().unwrap();
+
+            let mut vpn = start_vpn;
+            while vpn < end_vpn {
+                let covered = current.address_space.areas.iter().any(|area| {
+                    vpn >= area.start && vpn < area.end
+                });
+                if !covered {
+                    return -1;
+                }
+                vpn = vpn + 1;
+            }
+
+            current.address_space.unmap(start_vpn..end_vpn);
+            0
         }
     }
 }
